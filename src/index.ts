@@ -152,11 +152,15 @@ export interface PoPHealthRecord {
   anycast_announced: boolean;
 }
 
+import * as crypto from 'node:crypto';
+
 export interface AeitronClientOptions {
   apiKey: string;
   baseUrl?: string;
   apiVersion?: string;
   timeoutMs?: number;
+  maxRetries?: number;
+  defaultHeaders?: Record<string, string>;
   fetch?: typeof fetch;
 }
 
@@ -175,11 +179,172 @@ export class AeitronError extends Error {
   }
 }
 
+export class AuthenticationError extends AeitronError {
+  constructor(message = 'Authentication failed', code: string | number = 'UNAUTHORIZED', details?: unknown) {
+    super(401, message, code, details);
+    this.name = 'AuthenticationError';
+    Object.setPrototypeOf(this, AuthenticationError.prototype);
+  }
+}
+
+export class PermissionDeniedError extends AeitronError {
+  constructor(message = 'Permission denied', code: string | number = 'FORBIDDEN', details?: unknown) {
+    super(403, message, code, details);
+    this.name = 'PermissionDeniedError';
+    Object.setPrototypeOf(this, PermissionDeniedError.prototype);
+  }
+}
+
+export class ApprovalRequiredError extends AeitronError {
+  public readonly challengeRequestId: string;
+  public readonly domain?: string;
+  public readonly recordId?: string;
+
+  constructor(
+    message: string,
+    challengeRequestId: string,
+    domain?: string,
+    recordId?: string,
+    details?: unknown
+  ) {
+    super(403, message, 'APPROVAL_REQUIRED', details);
+    this.name = 'ApprovalRequiredError';
+    this.challengeRequestId = challengeRequestId;
+    this.domain = domain;
+    this.recordId = recordId;
+    Object.setPrototypeOf(this, ApprovalRequiredError.prototype);
+  }
+}
+
+export class NotFoundError extends AeitronError {
+  constructor(message = 'Resource not found', code: string | number = 'NOT_FOUND', details?: unknown) {
+    super(404, message, code, details);
+    this.name = 'NotFoundError';
+    Object.setPrototypeOf(this, NotFoundError.prototype);
+  }
+}
+
+export class ConflictError extends AeitronError {
+  constructor(message = 'Resource conflict', code: string | number = 'CONFLICT', details?: unknown) {
+    super(409, message, code, details);
+    this.name = 'ConflictError';
+    Object.setPrototypeOf(this, ConflictError.prototype);
+  }
+}
+
+export class ExpiredError extends AeitronError {
+  constructor(message = 'Resource expired or already consumed', code: string | number = 'GONE', details?: unknown) {
+    super(410, message, code, details);
+    this.name = 'ExpiredError';
+    Object.setPrototypeOf(this, ExpiredError.prototype);
+  }
+}
+
+export class ValidationError extends AeitronError {
+  public readonly validationErrors?: Record<string, unknown>;
+
+  constructor(
+    message = 'Validation failed',
+    code: string | number = 'VALIDATION_ERROR',
+    details?: unknown,
+    status = 400
+  ) {
+    super(status, message, code, details);
+    this.name = 'ValidationError';
+    if (typeof details === 'object' && details !== null) {
+      this.validationErrors = details as Record<string, unknown>;
+    }
+    Object.setPrototypeOf(this, ValidationError.prototype);
+  }
+}
+
+export class RateLimitError extends AeitronError {
+  public readonly retryAfterSeconds?: number;
+
+  constructor(message = 'Rate limit exceeded', retryAfterSeconds?: number, code: string | number = 'RATE_LIMIT_EXCEEDED', details?: unknown) {
+    super(429, message, code, details);
+    this.name = 'RateLimitError';
+    this.retryAfterSeconds = retryAfterSeconds;
+    Object.setPrototypeOf(this, RateLimitError.prototype);
+  }
+}
+
+export class ServerError extends AeitronError {
+  constructor(status = 500, message = 'Internal server error', code: string | number = 'SERVER_ERROR', details?: unknown) {
+    super(status, message, code, details);
+    this.name = 'ServerError';
+    Object.setPrototypeOf(this, ServerError.prototype);
+  }
+}
+
+export class NetworkError extends AeitronError {
+  constructor(message = 'Network error', code: string | number = 'NETWORK_ERROR', details?: unknown) {
+    super(0, message, code, details);
+    this.name = 'NetworkError';
+    Object.setPrototypeOf(this, NetworkError.prototype);
+  }
+}
+
+export class WebhookSignature {
+  public static readonly DEFAULT_TOLERANCE_SECONDS = 300;
+
+  public static verify(
+    payload: string,
+    signatureHeader: string,
+    secret: string,
+    toleranceSeconds = WebhookSignature.DEFAULT_TOLERANCE_SECONDS
+  ): boolean {
+    if (!secret || typeof secret !== 'string') {
+      throw new ValidationError('Webhook secret must be a non-empty string');
+    }
+    if (!signatureHeader || typeof signatureHeader !== 'string') {
+      throw new ValidationError('Invalid webhook signature header format');
+    }
+
+    const items = signatureHeader.split(',');
+    let timestamp: number | null = null;
+    const signatures: string[] = [];
+
+    for (const item of items) {
+      const [k, v] = item.trim().split('=', 2);
+      if (k === 't') {
+        timestamp = parseInt(v, 10);
+      } else if (k === 'v1') {
+        signatures.push(v);
+      }
+    }
+
+    if (timestamp === null || isNaN(timestamp) || signatures.length === 0) {
+      throw new ValidationError('Invalid webhook signature header format. Expected "t=<timestamp>,v1=<sig>"');
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    if (toleranceSeconds > 0 && Math.abs(now - timestamp) > toleranceSeconds) {
+      throw new ValidationError(`Webhook signature timestamp outside acceptable tolerance (${toleranceSeconds}s). Potential replay attack.`);
+    }
+
+    const signedPayload = `${timestamp}.${payload}`;
+    const expectedSig = crypto.createHmac('sha256', secret).update(signedPayload).digest('hex');
+
+    for (const sig of signatures) {
+      const sigBuf = Buffer.from(sig, 'utf-8');
+      const expBuf = Buffer.from(expectedSig, 'utf-8');
+      if (sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf)) {
+        return true;
+      }
+    }
+
+    throw new AuthenticationError('Webhook signature verification failed. Computed signature does not match header.');
+  }
+}
+
 export class AeitronClient {
   private readonly apiKey: string;
   private readonly baseUrl: string;
   private readonly apiVersion: string;
   private readonly timeoutMs: number;
+  private readonly maxRetries: number;
+  private readonly defaultHeaders: Record<string, string>;
   private readonly fetchImpl: typeof fetch;
 
   public readonly inference: InferenceNamespace;
@@ -199,16 +364,18 @@ export class AeitronClient {
 
   constructor(options: AeitronClientOptions) {
     if (!options || !options.apiKey || typeof options.apiKey !== 'string') {
-      throw new AeitronError(400, 'AeitronClient requires a valid API key (e.g., nke_live_...)', 'INVALID_API_KEY');
+      throw new ValidationError('AeitronClient requires a valid API key (e.g., nke_live_...)', 'INVALID_API_KEY');
     }
     this.apiKey = options.apiKey.trim();
     this.baseUrl = (options.baseUrl || 'https://dashboard.aeitron.com').replace(/\/+$/, '');
     this.apiVersion = (options.apiVersion || '2026-11-01').trim();
     this.timeoutMs = options.timeoutMs && options.timeoutMs > 0 ? options.timeoutMs : 30000;
+    this.maxRetries = options.maxRetries !== undefined ? Math.max(0, options.maxRetries) : 2;
+    this.defaultHeaders = options.defaultHeaders || {};
     this.fetchImpl = options.fetch || (typeof fetch !== 'undefined' ? fetch : globalThis.fetch);
 
     if (!this.fetchImpl) {
-      throw new AeitronError(500, 'Global fetch implementation not found. Provide options.fetch.', 'NO_FETCH');
+      throw new ServerError(500, 'Global fetch implementation not found. Provide options.fetch.', 'NO_FETCH');
     }
 
     this.inference = new InferenceNamespace(this);
@@ -233,16 +400,23 @@ export class AeitronClient {
       method?: string;
       body?: unknown;
       headers?: Record<string, string>;
+      idempotencyKey?: string;
     } = {}
   ): Promise<{ data: T; headers: Headers }> {
+    const method = (options.method || 'GET').toUpperCase();
     const url = `${this.baseUrl}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
     const headers: Record<string, string> = {
       'Accept': 'application/json',
       'Authorization': `Bearer ${this.apiKey}`,
       'X-API-Key': this.apiKey,
       'Aeitron-Version': this.apiVersion,
+      ...this.defaultHeaders,
       ...options.headers
     };
+
+    if (options.idempotencyKey) {
+      headers['Idempotency-Key'] = options.idempotencyKey;
+    }
 
     let body: string | undefined;
     if (options.body !== undefined) {
@@ -250,59 +424,133 @@ export class AeitronClient {
       body = JSON.stringify(options.body);
     }
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const isIdempotent =
+      ['GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS'].includes(method) ||
+      !!options.idempotencyKey ||
+      !!headers['Idempotency-Key'] ||
+      !!headers['idempotency-key'];
 
-    try {
-      const response = await this.fetchImpl(url, {
-        method: options.method || 'GET',
-        headers,
-        body,
-        signal: controller.signal
-      });
+    const maxAttempts = (isIdempotent ? this.maxRetries : 0) + 1;
+    let attempt = 0;
+    let lastError: unknown;
 
-      const responseText = await response.text();
-      let responseJson: any = null;
-      if (responseText) {
-        try {
-          responseJson = JSON.parse(responseText);
-        } catch {
-          responseJson = { raw: responseText };
+    while (attempt < maxAttempts) {
+      attempt++;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+      try {
+        const response = await this.fetchImpl(url, {
+          method,
+          headers,
+          body,
+          signal: controller.signal
+        });
+
+        clearTimeout(timer);
+
+        const responseText = await response.text();
+        let responseJson: any = null;
+        if (responseText) {
+          try {
+            responseJson = JSON.parse(responseText);
+          } catch {
+            responseJson = { raw: responseText };
+          }
         }
-      }
 
-      if (!response.ok) {
-        const errorMsg =
-          (responseJson && (responseJson.error || responseJson.message)) ||
-          `HTTP ${response.status} ${response.statusText}`;
-        const errorCode = (responseJson && (responseJson.code || responseJson.error_code)) || response.status;
-        throw new AeitronError(response.status, String(errorMsg), errorCode, responseJson);
-      }
+        if (response.ok) {
+          return {
+            data: responseJson as T,
+            headers: response.headers
+          };
+        }
 
-      return {
-        data: responseJson as T,
-        headers: response.headers
-      };
-    } catch (err: any) {
-      if (err instanceof AeitronError) {
-        throw err;
+        // Retryable status codes on idempotent requests
+        if (attempt < maxAttempts && (response.status === 429 || (response.status >= 500 && response.status <= 504))) {
+          const retryAfter = parseInt(response.headers.get('retry-after') || '0', 10);
+          await this.backoff(attempt, retryAfter);
+          continue;
+        }
+
+        const message = String(
+          (responseJson && (responseJson.error || responseJson.message || responseJson.error_description)) ||
+          `HTTP ${response.status} ${response.statusText}`
+        );
+        const code = (responseJson && (responseJson.code || responseJson.error_code)) || response.status;
+
+        // Dual-Control DNS Deletion / Safety Challenge Detection
+        if (/del_req_[a-f0-9]+/i.test(message) || (responseJson && responseJson.requestId)) {
+          const challengeReqId = String(responseJson?.requestId || message.match(/del_req_[a-f0-9]+/i)?.[0]);
+          throw new ApprovalRequiredError(message, challengeReqId, responseJson?.domain, responseJson?.recordId, responseJson);
+        }
+
+        switch (response.status) {
+          case 400:
+            throw new ValidationError(message, code, responseJson, 400);
+          case 401:
+            throw new AuthenticationError(message, code, responseJson);
+          case 403:
+            throw new PermissionDeniedError(message, code, responseJson);
+          case 404:
+            throw new NotFoundError(message, code, responseJson);
+          case 409:
+            throw new ConflictError(message, code, responseJson);
+          case 410:
+            throw new ExpiredError(message, code, responseJson);
+          case 422:
+            throw new ValidationError(message, code, responseJson, 422);
+          case 429: {
+            const retryAfter = parseInt(response.headers.get('retry-after') || '0', 10);
+            throw new RateLimitError(message, retryAfter > 0 ? retryAfter : undefined, code, responseJson);
+          }
+          default:
+            if (response.status >= 500) {
+              throw new ServerError(response.status, message, code, responseJson);
+            }
+            throw new AeitronError(response.status, message, code, responseJson);
+        }
+      } catch (err: any) {
+        clearTimeout(timer);
+        lastError = err;
+        if (err instanceof AeitronError) {
+          throw err;
+        }
+        if (err.name === 'AbortError') {
+          if (isIdempotent && attempt < maxAttempts) {
+            await this.backoff(attempt, 0);
+            continue;
+          }
+          throw new NetworkError(`Request timed out after ${this.timeoutMs}ms`, 'TIMEOUT');
+        }
+        if (isIdempotent && attempt < maxAttempts) {
+          await this.backoff(attempt, 0);
+          continue;
+        }
+        throw new NetworkError(err.message || 'Network request failed', 'NETWORK_ERROR');
       }
-      if (err.name === 'AbortError') {
-        throw new AeitronError(504, `Request timed out after ${this.timeoutMs}ms`, 'TIMEOUT');
-      }
-      throw new AeitronError(500, err.message || 'Network request failed', 'NETWORK_ERROR', err);
-    } finally {
-      clearTimeout(timer);
     }
+
+    throw lastError || new ServerError(500, 'Max retry limit reached without response');
+  }
+
+  private async backoff(attempt: number, retryAfterSeconds: number): Promise<void> {
+    if (retryAfterSeconds > 0) {
+      await new Promise(r => setTimeout(r, retryAfterSeconds * 1000));
+      return;
+    }
+    const delay = Math.min(1500, 50 * Math.pow(2, attempt - 1));
+    const jitter = Math.random() * delay * 0.3;
+    await new Promise(r => setTimeout(r, delay + jitter));
   }
 }
 
 class InferenceNamespace {
   constructor(private readonly client: AeitronClient) {}
 
-  public async createCompletion(params: CompletionRequest): Promise<CompletionResponse> {
+  public async createCompletion(params: CompletionRequest, idempotencyKey?: string): Promise<CompletionResponse> {
     if (!params || !params.messages || !Array.isArray(params.messages)) {
-      throw new AeitronError(400, 'CompletionRequest requires a messages array', 'INVALID_PARAMS');
+      throw new ValidationError('CompletionRequest requires a messages array', 'INVALID_PARAMS');
     }
 
     const extraHeaders: Record<string, string> = {};
@@ -323,7 +571,8 @@ class InferenceNamespace {
     const res = await this.client.request<any>('/api/proxy/inference', {
       method: 'POST',
       headers: extraHeaders,
-      body: payload
+      body: payload,
+      idempotencyKey
     });
 
     const headers = res.headers;

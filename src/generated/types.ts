@@ -235,6 +235,21 @@ export interface DnsRecord {
   priority?: number;
 }
 
+export interface DnsDeletionRequest {
+  requestId: string;
+  domain?: string;
+  zoneId?: string;
+  recordId: string;
+  expiresAt: number;
+}
+
+export interface DnsApprovalResult {
+  success: boolean;
+  approvalToken: string;
+  requestId: string;
+  expiresAt: number;
+}
+
 export interface ComputeInstance {
   id: string;
   name: string;

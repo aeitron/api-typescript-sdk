@@ -23,6 +23,8 @@ import {
   DomainRegisterResponse,
   DnsZone,
   DnsRecord,
+  DnsDeletionRequest,
+  DnsApprovalResult,
   ComputeInstance,
   ProvisionComputeRequest,
   HostingAccount,
@@ -177,6 +179,42 @@ export class DNSNamespace {
       method: 'POST',
       body: record
     });
+    return res.data;
+  }
+
+  public async requestDeletion(zoneId: string, recordId: string): Promise<DnsDeletionRequest> {
+    const res = await this.client.request<DnsDeletionRequest>(
+      `/v1/dns/zones/${encodeURIComponent(zoneId)}/records/${encodeURIComponent(recordId)}/deletion-request`,
+      { method: 'POST' }
+    );
+    return res.data;
+  }
+
+  public async approveDeletion(requestId: string): Promise<DnsApprovalResult> {
+    const res = await this.client.request<DnsApprovalResult>('/v1/dns/approve-deletion', {
+      method: 'POST',
+      body: { requestId }
+    });
+    return res.data;
+  }
+
+  public async deleteRecord(
+    zoneId: string,
+    recordId: string,
+    options: { approvalToken?: string; confirm?: boolean } = {}
+  ): Promise<{ status: string; record_id: string }> {
+    const headers: Record<string, string> = {};
+    if (options.approvalToken) {
+      headers['X-Aeitron-Approval-Token'] = options.approvalToken;
+    }
+    const query = options.confirm ? '?confirm=true' : '';
+    const res = await this.client.request<{ status: string; record_id: string }>(
+      `/v1/dns/zones/${encodeURIComponent(zoneId)}/records/${encodeURIComponent(recordId)}${query}`,
+      {
+        method: 'DELETE',
+        headers
+      }
+    );
     return res.data;
   }
 }

@@ -29,6 +29,7 @@
   "author": "Aeitron Core Engineering",
   "license": "MIT",
   "devDependencies": {
+    "@types/node": "^26.6.6",
     "typescript": "^5.6.3"
   }
 }

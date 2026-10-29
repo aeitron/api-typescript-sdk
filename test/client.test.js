@@ -1,7 +1,22 @@
 const { describe, it } = require('node:test');
 const assert = require('assert');
 const http = require('http');
-const { AeitronClient, AeitronError } = require('../dist/index.js');
+const crypto = require('crypto');
+const {
+  AeitronClient,
+  AeitronError,
+  AuthenticationError,
+  PermissionDeniedError,
+  ApprovalRequiredError,
+  NotFoundError,
+  ConflictError,
+  ExpiredError,
+  ValidationError,
+  RateLimitError,
+  ServerError,
+  NetworkError,
+  WebhookSignature
+} = require('../dist/index.js');
 
 function safeClose(server) {
   return new Promise((resolve) => {
@@ -401,6 +416,279 @@ describe('Aeitron Official TypeScript SDK Acceptance Tests', () => {
 
       await legacyClient.request('/v1/status');
       assert.strictEqual(capturedVersionHeader, '2026-01-01');
+    } finally {
+      await safeClose(mockServer);
+    }
+  });
+
+  it('Requirement SDK.8: Specialized typed error hierarchy maps HTTP status codes accurately', async () => {
+    let returnStatus = 401;
+    let returnPayload = { error: 'UNAUTHORIZED', message: 'Token expired' };
+
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(returnStatus, { 'Content-Type': 'application/json', 'Retry-After': '12' });
+      res.end(JSON.stringify(returnPayload));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+
+    try {
+      const client = new AeitronClient({
+        apiKey: 'nke_live_test_key_123',
+        baseUrl: `http://127.0.0.1:${port}`,
+        maxRetries: 0
+      });
+
+      // 401 AuthenticationError
+      returnStatus = 401;
+      returnPayload = { error: 'UNAUTHORIZED', message: 'Invalid token' };
+      await assert.rejects(async () => client.request('/v1/test'), (err) => err instanceof AuthenticationError && err.status === 401);
+
+      // 403 PermissionDeniedError
+      returnStatus = 403;
+      returnPayload = { error: 'FORBIDDEN', message: 'Access denied' };
+      await assert.rejects(async () => client.request('/v1/test'), (err) => err instanceof PermissionDeniedError && err.status === 403);
+
+      // 404 NotFoundError
+      returnStatus = 404;
+      returnPayload = { error: 'NOT_FOUND', message: 'Zone not found' };
+      await assert.rejects(async () => client.request('/v1/test'), (err) => err instanceof NotFoundError && err.status === 404);
+
+      // 409 ConflictError
+      returnStatus = 409;
+      returnPayload = { error: 'CONFLICT', message: 'Domain already exists' };
+      await assert.rejects(async () => client.request('/v1/test'), (err) => err instanceof ConflictError && err.status === 409);
+
+      // 410 ExpiredError
+      returnStatus = 410;
+      returnPayload = { error: 'GONE', message: 'Challenge expired' };
+      await assert.rejects(async () => client.request('/v1/test'), (err) => err instanceof ExpiredError && err.status === 410);
+
+      // 422 ValidationError
+      returnStatus = 422;
+      returnPayload = { error: 'UNPROCESSABLE_ENTITY', message: 'Invalid IP format', fields: { ip: 'bad' } };
+      await assert.rejects(async () => client.request('/v1/test'), (err) => err instanceof ValidationError && err.status === 422);
+
+      // 429 RateLimitError with retryAfterSeconds
+      returnStatus = 429;
+      returnPayload = { error: 'RATE_LIMIT_EXCEEDED', message: 'Too many requests' };
+      await assert.rejects(
+        async () => client.request('/v1/test'),
+        (err) => err instanceof RateLimitError && err.status === 429 && err.retryAfterSeconds === 12
+      );
+
+      // 502 ServerError
+      returnStatus = 502;
+      returnPayload = { error: 'BAD_GATEWAY', message: 'Edge node offline' };
+      await assert.rejects(async () => client.request('/v1/test'), (err) => err instanceof ServerError && err.status === 502);
+    } finally {
+      await safeClose(mockServer);
+    }
+  });
+
+  it('Requirement SDK.9: Dual-control DNS deletion and operator approval workflow', async () => {
+    let capturedApprovalHeader = null;
+    let capturedUrl = null;
+
+    const mockServer = http.createServer((req, res) => {
+      capturedUrl = req.url;
+      if (req.method === 'POST' && req.url === '/v1/dns/zones/zone-123/records/rec-456/deletion-request') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          requestId: 'del_req_dual_control_01',
+          zoneId: 'zone-123',
+          recordId: 'rec-456',
+          expiresAt: Date.now() + 60000
+        }));
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/v1/dns/approve-deletion') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: true,
+          approvalToken: 'del_tok_signature_token_789',
+          requestId: 'del_req_dual_control_01',
+          expiresAt: Date.now() + 60000
+        }));
+        return;
+      }
+
+      if (req.method === 'DELETE' && req.url === '/v1/dns/zones/zone-123/records/rec-456?confirm=true') {
+        capturedApprovalHeader = req.headers['x-aeitron-approval-token'];
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          status: 'deleted',
+          record_id: 'rec-456'
+        }));
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+
+    try {
+      const client = new AeitronClient({
+        apiKey: 'nke_live_agent_token',
+        baseUrl: `http://127.0.0.1:${port}`
+      });
+
+      // 1. Initiator requests deletion
+      const deletionReq = await client.dns.requestDeletion('zone-123', 'rec-456');
+      assert.strictEqual(deletionReq.requestId, 'del_req_dual_control_01');
+
+      // 2. Operator authorizes request
+      const approval = await client.dns.approveDeletion(deletionReq.requestId);
+      assert.strictEqual(approval.success, true);
+      assert.strictEqual(approval.approvalToken, 'del_tok_signature_token_789');
+
+      // 3. Client executes deletion with single-use token and confirmation
+      const delResult = await client.dns.deleteRecord('zone-123', 'rec-456', {
+        approvalToken: approval.approvalToken,
+        confirm: true
+      });
+      assert.strictEqual(delResult.status, 'deleted');
+      assert.strictEqual(capturedApprovalHeader, 'del_tok_signature_token_789');
+      assert.ok(capturedUrl.includes('confirm=true'));
+    } finally {
+      await safeClose(mockServer);
+    }
+  });
+
+  it('Requirement SDK.10: Challenge guard fail-closed triggers ApprovalRequiredError with requestId', async () => {
+    const mockServer = http.createServer((req, res) => {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: 'APPROVAL_REQUIRED',
+        message: 'Destructive DNS deletion requires human operator approval. Request ID: del_req_safety_gate_999',
+        requestId: 'del_req_safety_gate_999',
+        domain: 'aeitron.com',
+        recordId: 'rec_dns_01'
+      }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+
+    try {
+      const client = new AeitronClient({
+        apiKey: 'nke_live_agent_token',
+        baseUrl: `http://127.0.0.1:${port}`,
+        maxRetries: 0
+      });
+
+      await assert.rejects(
+        async () => client.dns.deleteRecord('zone_01', 'rec_dns_01'),
+        (err) => {
+          assert.ok(err instanceof ApprovalRequiredError);
+          assert.strictEqual(err.challengeRequestId, 'del_req_safety_gate_999');
+          assert.strictEqual(err.domain, 'aeitron.com');
+          assert.strictEqual(err.recordId, 'rec_dns_01');
+          assert.strictEqual(err.status, 403);
+          return true;
+        }
+      );
+    } finally {
+      await safeClose(mockServer);
+    }
+  });
+
+  it('Requirement SDK.11: Webhook signature verification and replay protection', () => {
+    const secret = 'whsec_test_secret_key_abcdef1234567890';
+    const payload = JSON.stringify({ id: 'evt_01', type: 'domain.verified', data: { domain: 'aeitron.com' } });
+    const timestamp = Math.floor(Date.now() / 1000);
+    const signature = crypto.createHmac('sha256', secret).update(`${timestamp}.${payload}`).digest('hex');
+    const header = `t=${timestamp},v1=${signature}`;
+
+    // 1. Valid signature passes
+    assert.strictEqual(WebhookSignature.verify(payload, header, secret), true);
+
+    // 2. Forged signature throws AuthenticationError
+    assert.throws(
+      () => WebhookSignature.verify(payload, `t=${timestamp},v1=bad_hex_sig`, secret),
+      (err) => err instanceof AuthenticationError
+    );
+
+    // 3. Expired timestamp outside tolerance throws ValidationError (anti-replay)
+    const oldTimestamp = timestamp - 600;
+    const oldSig = crypto.createHmac('sha256', secret).update(`${oldTimestamp}.${payload}`).digest('hex');
+    assert.throws(
+      () => WebhookSignature.verify(payload, `t=${oldTimestamp},v1=${oldSig}`, secret, 300),
+      (err) => err instanceof ValidationError && err.message.includes('outside acceptable tolerance')
+    );
+  });
+
+  it('Requirement SDK.12: Automatic retries with exponential backoff on transient 503 errors', async () => {
+    let attempts = 0;
+    const mockServer = http.createServer((req, res) => {
+      attempts++;
+      if (attempts === 1) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Service Unavailable' }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ healthy: true, attempts }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+
+    try {
+      const client = new AeitronClient({
+        apiKey: 'nke_live_test_key',
+        baseUrl: `http://127.0.0.1:${port}`,
+        maxRetries: 2
+      });
+
+      const res = await client.request('/v1/health');
+      assert.strictEqual(res.data.healthy, true);
+      assert.strictEqual(attempts, 2);
+    } finally {
+      await safeClose(mockServer);
+    }
+  });
+
+  it('Requirement SDK.13: Idempotency-Key header is transmitted and enables retry on mutative requests', async () => {
+    let capturedIdempKey = null;
+    let attempts = 0;
+
+    const mockServer = http.createServer((req, res) => {
+      attempts++;
+      capturedIdempKey = req.headers['idempotency-key'];
+      if (attempts === 1) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Temporary Internal Error' }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ created: true }));
+    });
+
+    await new Promise((resolve) => mockServer.listen(0, '127.0.0.1', resolve));
+    const port = mockServer.address().port;
+
+    try {
+      const client = new AeitronClient({
+        apiKey: 'nke_live_test_key',
+        baseUrl: `http://127.0.0.1:${port}`,
+        maxRetries: 2
+      });
+
+      const res = await client.request('/v1/deploy', {
+        method: 'POST',
+        body: { service: 'gateway' },
+        idempotencyKey: 'idemp_key_custom_42'
+      });
+
+      assert.strictEqual(res.data.created, true);
+      assert.strictEqual(capturedIdempKey, 'idemp_key_custom_42');
+      assert.strictEqual(attempts, 2, 'POST with idempotencyKey must be safely retried on 500');
     } finally {
       await safeClose(mockServer);
     }
